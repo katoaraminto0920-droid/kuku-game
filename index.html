@@ -4244,8 +4244,23 @@ function sanitizeCustom(o) {
   });
   return r;
 }
+let IDB = null;
+function idbOpen() { return new Promise(res => { try { const r = indexedDB.open('kuku81', 1); r.onupgradeneeded = () => r.result.createObjectStore('img'); r.onsuccess = () => res(r.result); r.onerror = () => res(null); r.onblocked = () => res(null); } catch (e) { res(null); } }); }
+function idbAll() { return new Promise(res => { const out = {}; try { const c = IDB.transaction('img').objectStore('img').openCursor(); c.onsuccess = () => { const cur = c.result; if (cur) { out[cur.key] = cur.value; cur.continue(); } else res(out); }; c.onerror = () => res(out); } catch (e) { res(out); } }); }
 function loadCustom() { try { const raw = localStorage.getItem(CUSTOM_KEY); if (raw) CUSTOM = sanitizeCustom(JSON.parse(raw)); } catch (e) { CUSTOM = {}; } }
-function saveCustom() { try { localStorage.setItem(CUSTOM_KEY, JSON.stringify(CUSTOM)); return true; } catch (e) { return false; } }
+function saveCustom() {
+  const text = {};
+  Object.keys(CUSTOM).forEach(k => { const e = Object.assign({}, CUSTOM[k]); if (IDB && e.image) delete e.image; text[k] = e; });
+  try { localStorage.setItem(CUSTOM_KEY, JSON.stringify(text)); } catch (e) { return false; }
+  if (IDB) {                                         // がぞうは IndexedDB へ（ようりょうが おおきい）
+    try {
+      const tx = IDB.transaction('img', 'readwrite'), st = tx.objectStore('img');
+      st.clear(); Object.keys(CUSTOM).forEach(k => { if (CUSTOM[k].image) st.put(CUSTOM[k].image, +k); });
+      tx.onerror = () => toast('がぞうの ほぞんに しっぱいしました');
+    } catch (e) { return false; }
+  }
+  return true;
+}
 const getCustom = (slot) => Object.assign({}, CUSTOM_BUILTIN[slot], CUSTOM[slot]);
 const ORIG = CHARACTERS.map(c => ({ id: c.id, fname: c.fighter ? c.fighter.name : null, img: c.id ? IMG_DATA[c.id] : undefined }));
 function applyCustom(slot) {
@@ -4270,19 +4285,41 @@ function applyCustom(slot) {
 }
 function applyAllCustom() { CHARACTERS.forEach((_, i) => applyCustom(i)); assignUnlocks(); }
 loadCustom(); applyAllCustom();
+const CUSTOM_READY = idbOpen().then(db => {
+  IDB = db; if (!db) return;
+  return idbAll().then(imgs => {
+    Object.keys(imgs).forEach(k => { if (+k >= 0 && +k < 84 && typeof imgs[k] === 'string' && imgs[k].indexOf('data:image/') === 0) CUSTOM[k] = Object.assign({}, CUSTOM[k], { image: imgs[k] }); });
+    applyAllCustom(); saveCustom();                  // むかしの ほぞん（localStorageの がぞう）も ここで うつしかえる
+  });
+}).catch(() => {});
+const _kukuInit = KUKU_INIT;
+KUKU_INIT = function () { Promise.race([CUSTOM_READY, new Promise(r => setTimeout(r, 2500))]).then(() => _kukuInit()); };
 
-function loadImageFile(file, maxSide, cb) {
+function hasAlpha(ctx, w, h) {
+  try { const d = ctx.getImageData(0, 0, w, h).data; for (let i = 3; i < d.length; i += 4 * 7) if (d[i] < 250) return true; } catch (e) {}
+  return false;
+}
+function loadImageFile(file, _unused, cb) {
   const r = new FileReader();
   r.onload = () => {
     const img = new Image();
     img.onload = () => {
-      const s = Math.min(1, maxSide / Math.max(img.width, img.height)), c = document.createElement('canvas');
-      c.width = Math.max(1, Math.round(img.width * s)); c.height = Math.max(1, Math.round(img.height * s));
-      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-      let d = c.toDataURL('image/webp', 0.85);
-      if (d.indexOf('data:image/webp') !== 0) d = c.toDataURL('image/png');
-      if (d.length > 600000 && maxSide > 260) return loadImageFile(file, 260, cb);
-      cb(d);
+      const MAX_CHARS = 150000;                       // 1まいあたり 約110KB いかに おさえる
+      let best = null;
+      for (const side of [420, 340, 280, 230, 190, 150]) {
+        const s = Math.min(1, side / Math.max(img.width, img.height)), c = document.createElement('canvas');
+        c.width = Math.max(1, Math.round(img.width * s)); c.height = Math.max(1, Math.round(img.height * s));
+        const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0, c.width, c.height);
+        const alpha = hasAlpha(ctx, c.width, c.height);
+        let d = c.toDataURL('image/webp', 0.8);
+        if (d.indexOf('data:image/webp') !== 0) {      // WebPが つかえない（iPhone など）
+          if (alpha) d = c.toDataURL('image/png');     // とうめい部分が あるときは PNG
+          else d = c.toDataURL('image/jpeg', 0.82);    // ないときは JPEG（ずっと ちいさい）
+        }
+        if (!best || d.length < best.length) best = d;
+        if (d.length <= MAX_CHARS) { best = d; break; }
+      }
+      cb(best);
     };
     img.onerror = () => toast('がぞうを よめませんでした');
     img.src = r.result;
@@ -4324,7 +4361,7 @@ function editorAct(a) {
     set('name', v('ed-name').slice(0, 12)); set('ability', v('ed-ability').slice(0, 30)); set('power', v('ed-power').slice(0, 20)); set('desc', v('ed-desc').slice(0, 400));
     if (ED_IMG === '__del__') delete e.image; else if (ED_IMG) e.image = ED_IMG;
     if (Object.keys(e).length) CUSTOM[slot] = e; else delete CUSTOM[slot];
-    if (!saveCustom()) { if (prev) CUSTOM[slot] = prev; else delete CUSTOM[slot]; toast('ほぞんできませんでした（がぞうが おおきい？）'); return; }
+    if (!saveCustom()) { if (prev) CUSTOM[slot] = prev; else delete CUSTOM[slot]; toast('ほぞんできませんでした（ブラウザの ほぞんようりょうが いっぱい）'); return; }
     const was = CHARACTERS[slot].implemented;
     afterEdit(slot, 'ほぞんしました！');
     if (!CHARACTERS[slot].implemented && (e.name || e.image)) toast('なまえと がぞうが そろうと キャラクターに なるよ');
